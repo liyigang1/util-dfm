@@ -24,6 +24,32 @@ USING_IO_NAMESPACE
  * DFileInfoPrivate
  ***********************************************/
 
+static gboolean retireUnrefCb(gpointer data)
+{
+    g_object_unref(static_cast<GFileInfo *>(data));
+    return G_SOURCE_REMOVE;
+}
+
+static GFileInfo *atomicLoadGFileInfo(GFileInfo *const *slot)
+{
+    return static_cast<GFileInfo *>(g_atomic_pointer_get(reinterpret_cast<const volatile gpointer *>(slot)));
+}
+
+static GFileInfo *refGFileInfo(GFileInfo *info)
+{
+    return info ? static_cast<GFileInfo *>(g_object_ref(info)) : nullptr;
+}
+
+static void replaceGFileInfo(GFileInfo **slot, GFileInfo *value)
+{
+    GFileInfo *old = nullptr;
+    do {
+        old = atomicLoadGFileInfo(slot);
+    } while (!g_atomic_pointer_compare_and_exchange(reinterpret_cast<volatile gpointer *>(slot), old, value));
+    if (old)
+        g_timeout_add_seconds_full(G_PRIORITY_LOW, 3, retireUnrefCb, old, nullptr);
+}
+
 typedef struct
 {
     DFileInfo::AttributeAsyncCallback callback;
@@ -249,11 +275,7 @@ bool DFileInfoPrivate::queryInfoSync()
         return false;
     }
 
-    if (this->gfileinfo) {
-        g_object_unref(this->gfileinfo);
-        this->gfileinfo = nullptr;
-    }
-    this->gfileinfo = fileinfo;
+    replaceGFileInfo(&this->gfileinfo, fileinfo);
     initFinished = true;
     isQuquerying = false;
     return true;
@@ -300,6 +322,7 @@ bool DFileInfoPrivate::ensureStatxCached() const
 
 QVariant DFileInfoPrivate::attributesBySelf(DFileInfo::AttributeID id)
 {
+    g_autoptr(GFileInfo) gfileinfo = refGFileInfo(atomicLoadGFileInfo(&this->gfileinfo));
     QVariant retValue;
     switch (id) {
     case DFileInfo::AttributeID::kStandardIsHidden: {
@@ -603,6 +626,7 @@ DFile::Permissions DFileInfoPrivate::permissions() const
 
 bool DFileInfoPrivate::exists() const
 {
+    g_autoptr(GFileInfo) gfileinfo = refGFileInfo(atomicLoadGFileInfo(&this->gfileinfo));
     if (!gfileinfo)
         return false;
     return g_file_info_get_file_type(gfileinfo) != G_FILE_TYPE_UNKNOWN;
@@ -639,7 +663,7 @@ void DFileInfoPrivate::queryInfoAsyncCallback(GObject *sourceObject, GAsyncResul
     }
 
     if (data->me) {
-        data->me->gfileinfo = fileinfo;
+        replaceGFileInfo(&data->me->gfileinfo, fileinfo);
         data->me->initFinished = true;
     }
 
@@ -677,7 +701,7 @@ void DFileInfoPrivate::queryInfoAsyncCallback2(GObject *sourceObject, GAsyncResu
     }
 
     if (data->me) {
-        data->me->gfileinfo = fileinfo;
+        replaceGFileInfo(&data->me->gfileinfo, fileinfo);
         data->me->initFinished = true;
 
         future->finished();
@@ -759,16 +783,17 @@ QVariant DFileInfo::attribute(DFileInfo::AttributeID id, bool *success) const
         }
     }
 
+    g_autoptr(GFileInfo) gfileinfo = refGFileInfo(atomicLoadGFileInfo(&d->gfileinfo));
     QVariant retValue;
     if (id > DFileInfo::AttributeID::kCustomStart) {
         const QString &path = d->uri.path();
-        retValue = DLocalHelper::customAttributeFromPathAndInfo(path, d->gfileinfo, id);
+        retValue = DLocalHelper::customAttributeFromPathAndInfo(path, gfileinfo, id);
     } else {
-        if (d->gfileinfo) {
+        if (gfileinfo) {
             DFMIOErrorCode errorCode(DFM_IO_ERROR_NONE);
             if (!d->attributesRealizationSelf.contains(id)) {
                 QMutexLocker lk(&d->mutex);
-                retValue = DLocalHelper::attributeFromGFileInfo(d->gfileinfo, id, errorCode);
+                retValue = DLocalHelper::attributeFromGFileInfo(gfileinfo, id, errorCode);
                 if (errorCode != DFM_IO_ERROR_NONE)
                     const_cast<DFileInfoPrivate *>(d.data())->error.setCode(errorCode);
             } else {
@@ -935,11 +960,12 @@ bool DFileInfo::hasAttribute(DFileInfo::AttributeID id) const
             return false;
     }
 
-    if (d->gfileinfo) {
+    g_autoptr(GFileInfo) gfileinfo = refGFileInfo(atomicLoadGFileInfo(&d->gfileinfo));
+    if (gfileinfo) {
         const std::string &key = DLocalHelper::attributeStringById(id);
         if (key.empty())
             return false;
-        return g_file_info_has_attribute(d->gfileinfo, key.c_str());
+        return g_file_info_has_attribute(gfileinfo, key.c_str());
     }
 
     return false;
@@ -991,40 +1017,41 @@ QVariant DFileInfo::customAttribute(const char *key, const DFileInfo::DFileAttri
             return QVariant();
     }
 
-    if (!d->gfileinfo)
+    g_autoptr(GFileInfo) gfileinfo = refGFileInfo(atomicLoadGFileInfo(&d->gfileinfo));
+    if (!gfileinfo)
         return QVariant();
 
     switch (type) {
     case DFileInfo::DFileAttributeType::kTypeString: {
-        const char *ret = g_file_info_get_attribute_string(d->gfileinfo, key);
+        const char *ret = g_file_info_get_attribute_string(gfileinfo, key);
         return QVariant(ret);
     }
     case DFileInfo::DFileAttributeType::kTypeByteString: {
-        const char *ret = g_file_info_get_attribute_byte_string(d->gfileinfo, key);
+        const char *ret = g_file_info_get_attribute_byte_string(gfileinfo, key);
         return QVariant(ret);
     }
     case DFileInfo::DFileAttributeType::kTypeBool: {
-        bool ret = g_file_info_get_attribute_boolean(d->gfileinfo, key);
+        bool ret = g_file_info_get_attribute_boolean(gfileinfo, key);
         return QVariant(ret);
     }
     case DFileInfo::DFileAttributeType::kTypeUInt32: {
-        uint32_t ret = g_file_info_get_attribute_uint32(d->gfileinfo, key);
+        uint32_t ret = g_file_info_get_attribute_uint32(gfileinfo, key);
         return QVariant(ret);
     }
     case DFileInfo::DFileAttributeType::kTypeInt32: {
-        int32_t ret = g_file_info_get_attribute_int32(d->gfileinfo, key);
+        int32_t ret = g_file_info_get_attribute_int32(gfileinfo, key);
         return QVariant(ret);
     }
     case DFileInfo::DFileAttributeType::kTypeUInt64: {
-        uint64_t ret = g_file_info_get_attribute_uint64(d->gfileinfo, key);
+        uint64_t ret = g_file_info_get_attribute_uint64(gfileinfo, key);
         return QVariant(qulonglong(ret));
     }
     case DFileInfo::DFileAttributeType::kTypeInt64: {
-        int64_t ret = g_file_info_get_attribute_int64(d->gfileinfo, key);
+        int64_t ret = g_file_info_get_attribute_int64(gfileinfo, key);
         return QVariant(qulonglong(ret));
     }
     case DFileInfo::DFileAttributeType::kTypeStringV: {
-        char **ret = g_file_info_get_attribute_stringv(d->gfileinfo, key);
+        char **ret = g_file_info_get_attribute_stringv(gfileinfo, key);
         QStringList retValue;
         for (int i = 0; ret && ret[i]; ++i) {
             retValue.append(QString::fromLocal8Bit(ret[i]));
